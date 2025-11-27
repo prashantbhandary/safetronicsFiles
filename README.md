@@ -1,4 +1,4 @@
-# SafeTonics Multi-Sensor Helmet System
+# SafeTronics Multi-Sensor Helmet System
 
 A comprehensive IoT safety monitoring system built with ESP32 and multiple sensors for real-time health and safety tracking.
 

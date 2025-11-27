@@ -25,12 +25,12 @@ bool oldDeviceConnected = false;
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      Serial.println("BLE Client Connected!");
+      Serial.println("BLE Connected");
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      Serial.println("BLE Client Disconnected!");
+      // Serial.println("BLE Client Disconnected!");
     }
 };
 
@@ -39,6 +39,22 @@ MPU9250_asukiaaa mySensor;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 MAX30105 particleSensor;
 
+// Button and Buzzer Pins
+const int button1Pin = 23;  // SOS button
+const int button2Pin = 4;   // Cancel/Stop button
+const int buzzerPin = 13;   // Buzzer
+
+// Button and Alert Variables
+bool sosButtonPressed = false;
+bool cancelButtonPressed = false;
+bool fallAlertActive = false;
+bool buzzerActive = false;
+bool shortBeepActive = false;
+unsigned long shortBeepStartTime = 0;
+const unsigned long SHORT_BEEP_DURATION = 200;  // 200ms beep
+unsigned long fallDetectedTime = 0;
+const unsigned long FALL_CANCEL_TIMEOUT = 3000;  // 3 seconds to cancel
+
 // Shared Data Structure
 struct SensorData {
   int heartRate;
@@ -46,17 +62,49 @@ struct SensorData {
   float ambientTemp;
   float bodyTemp;
   String mpuStatus;
-  String fallStatus;
+  String sosStatus;
   bool dataReady;
   unsigned long lastUpdate;
 };
 
+
+
 // Global variables with mutex protection
-SensorData sharedData = {75, 98, 25.0, 36.5, "Normal", "No Fall", true, 0};
+SensorData sharedData = {75, 98, 25.0, 36.5, "", "", true, 0};
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t i2cMutex;  // Mutex for I2C bus access
 unsigned long bleTransmitStart = 0;  // Timer for 60-second BLE transmission
 bool impactDetectedForBLE = false;   // Flag for immediate impact transmission
+bool sosMessageForBLE = false;       // Flag for immediate SOS transmission
+
+// Button Interrupt Service Routines
+volatile bool button1Pressed = false;
+volatile bool button2Pressed = false;
+
+void IRAM_ATTR button1ISR() {
+  button1Pressed = true;
+}
+
+void IRAM_ATTR button2ISR() {
+  button2Pressed = true;
+}
+
+// Buzzer Control Functions
+void buzzerShortBeep() {
+  shortBeepActive = true;
+  shortBeepStartTime = millis();
+  digitalWrite(buzzerPin, HIGH);
+  // Serial.println("SOS Buzzer beep started");
+}
+
+void startBuzzerAlert() {
+  buzzerActive = true;
+}
+
+void stopBuzzerAlert() {
+  buzzerActive = false;
+  digitalWrite(buzzerPin, LOW);
+}
 
 // MPU variables
 #define MPU_ADDR 0x68
@@ -95,6 +143,8 @@ void spo2Task(void *parameter);
 void mpuTask(void *parameter);
 void mlxTask(void *parameter);
 void bleTask(void *parameter);
+void buttonTask(void *parameter);
+void buzzerTask(void *parameter);
 bool isMPUConnected();
 void initializeBLE();
 void initializeSensors();
@@ -110,6 +160,25 @@ void setup() {
     Serial.println("Failed to create mutex!");
     while(1);
   }
+  
+  // Initialize button and buzzer pins
+  pinMode(button1Pin, INPUT);
+  pinMode(button2Pin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  
+  // Attach button interrupts
+  attachInterrupt(digitalPinToInterrupt(button1Pin), button1ISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(button2Pin), button2ISR, FALLING);
+  
+  Serial.println("Buttons and buzzer initialized!");
+  
+  // Test buzzer on startup
+  Serial.println("Testing buzzer...");
+  digitalWrite(buzzerPin, HIGH);
+  delay(300);
+  digitalWrite(buzzerPin, LOW);
+  Serial.println("Buzzer test complete!");
   
   // Initialize all sensors
   initializeSensors();
@@ -162,6 +231,26 @@ void setup() {
     1,
     NULL,
     1
+  );
+  
+  xTaskCreatePinnedToCore(
+    buttonTask,
+    "ButtonTask",
+    2048,
+    NULL,
+    4,  // High priority for responsiveness
+    NULL,
+    0
+  );
+  
+  xTaskCreatePinnedToCore(
+    buzzerTask,
+    "BuzzerTask",
+    2048,
+    NULL,
+    3,  // High priority for alerts
+    NULL,
+    0
   );
   
   Serial.println("All tasks created successfully!");
@@ -226,7 +315,7 @@ void heartRateTask(void *parameter) {
           sharedData.heartRate = avgHR;
           xSemaphoreGive(dataMutex);
         }
-        Serial.println("HR 60-sec average: " + String(avgHR) + " BPM");
+        // Serial.println("HR 60-sec average: " + String(avgHR) + " BPM");
       }
       hrMinuteStart = millis();
       hrSum = 0;
@@ -288,7 +377,7 @@ void spo2Task(void *parameter) {
           sharedData.spo2 = avgSPO2;
           xSemaphoreGive(dataMutex);
         }
-        Serial.println("SPO2 60-sec average: " + String(avgSPO2) + "%");
+        // Serial.println("SPO2 60-sec average: " + String(avgSPO2) + "%");
       }
       spo2Sum = 0;
       spo2Count = 0;
@@ -334,25 +423,41 @@ void mpuTask(void *parameter) {
     if (!impactDetected && g > 2.5) {
       impactDetected = true;
       impactTime = millis();
+      fallDetectedTime = millis();  // Start 3-second cancel window
+      fallAlertActive = true;
       impactMsg = "Impact detected";
-      impactDetectedForBLE = true;  // Set flag for immediate BLE transmission
-      Serial.println("IMPACT DETECTED! G-force: " + String(g));
+      
+      Serial.println("IMPACT! G:" + String(g));
+      // Serial.println("Press cancel button within 3 seconds to cancel alert");
+      
+      // Start buzzer immediately
+      startBuzzerAlert();
     }
     
-    // Reset impact after 5 seconds (give time for BLE transmission)
-    if (impactDetected && (millis() - impactTime > 5000)) {
+    // Check if 3 seconds passed without cancel - then send BLE ONCE
+    if (fallAlertActive && (millis() - fallDetectedTime >= FALL_CANCEL_TIMEOUT)) {
+      if (!impactDetectedForBLE) {  // Only set once
+        impactDetectedForBLE = true;
+        fallAlertActive = false;  // Stop the alert cycle immediately
+        // Serial.println("3 seconds passed - sending fall alert via BLE (ONCE)");
+      }
+    }
+    
+    // Reset impact after 10 seconds total (give time for BLE transmission)
+    if (impactDetected && (millis() - impactTime > 10000)) {
       impactDetected = false;
+      fallAlertActive = false;
+      stopBuzzerAlert();
       impactMsg = "";
     }
     
-    // Update shared data - always set current status
+    // Update shared data - keep impact message available for BLE
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       if (impactDetected) {
         sharedData.mpuStatus = "Impact detected";
       } else {
         sharedData.mpuStatus = "";
       }
-      sharedData.fallStatus = "";
       xSemaphoreGive(dataMutex);
     }
     
@@ -385,7 +490,7 @@ void mlxTask(void *parameter) {
           sharedData.lastUpdate = millis();
           xSemaphoreGive(dataMutex);
         }
-        Serial.println("MLX Temp 60-sec reading - Ambient: " + String(ambientTemp,1) + "C, Body: " + String(bodyTemp,1) + "C");
+        // Serial.println("MLX Temp 60-sec reading - Ambient: " + String(ambientTemp,1) + "C, Body: " + String(bodyTemp,1) + "C");
       }
       
       mlxReadStart = millis();  // Reset 60-second timer
@@ -395,6 +500,8 @@ void mlxTask(void *parameter) {
   }
 }
 
+
+
 void bleTask(void *parameter) {
   bleTransmitStart = millis();  // Initialize BLE timer
   
@@ -403,26 +510,37 @@ void bleTask(void *parameter) {
     if (!deviceConnected && oldDeviceConnected) {
       delay(500); // Give time for bluetooth stack to get ready
       pServer->startAdvertising();
-      Serial.println("Start advertising again...");
+      // Serial.println("Start advertising again...");
       oldDeviceConnected = deviceConnected;
     }
     if (deviceConnected && !oldDeviceConnected) {
+      // Serial.println("BLE Client connected!");
       oldDeviceConnected = deviceConnected;
     }
     
     bool shouldTransmit = false;
     
-    // Check if 60 seconds have passed OR impact detected
-    if ((millis() - bleTransmitStart >= 60000) || impactDetectedForBLE) {
+    // Check for transmission triggers
+    bool isRegularTransmission = (millis() - bleTransmitStart >= 60000);
+    bool isImpactTransmission = impactDetectedForBLE;
+    bool isSOSTransmission = sosMessageForBLE;
+    
+    if (isRegularTransmission || isImpactTransmission || isSOSTransmission) {
       shouldTransmit = true;
       
-      if (millis() - bleTransmitStart >= 60000) {
+      if (isRegularTransmission) {
         bleTransmitStart = millis();  // Reset 60-second timer
-        Serial.println("60-second BLE transmission");
+        // Serial.println("60-second BLE transmission");
       }
       
-      if (impactDetectedForBLE) {
-        Serial.println("Immediate impact BLE transmission");
+      if (isImpactTransmission) {
+        impactDetectedForBLE = false;  // Reset IMMEDIATELY to prevent repeats
+        // Serial.println("Immediate impact BLE transmission (ONE TIME ONLY)");
+      }
+      
+      if (isSOSTransmission) {
+        sosMessageForBLE = false;  // Reset IMMEDIATELY to prevent repeats
+        // Serial.println("Immediate SOS BLE transmission (ONE TIME ONLY)");
       }
     }
     
@@ -433,34 +551,133 @@ void bleTask(void *parameter) {
         localData = sharedData;
         xSemaphoreGive(dataMutex);
       }
+  
+      // Create JSON payload using snprintf
+
+      // String payload = String(localData.heartRate) + "," + 
+      //                 String(localData.spo2) + "," + 
+      //                 String(localData.ambientTemp, 1) + "," + 
+      //                 String(localData.bodyTemp, 1) + "," + 
+      //                 localData.mpuStatus + "," + 
+      //                 localData.sosStatus;
       
-      // Send data
-      String payload = String(localData.heartRate) + "," + 
-                      String(localData.spo2) + "," + 
-                      String(localData.ambientTemp, 1) + "," + 
-                      String(localData.bodyTemp, 1) + "," + 
-                      localData.mpuStatus + "," + 
-                      localData.fallStatus;
+      // // Set BLE characteristic value
+      // sensorChar->setValue(payload.c_str())
+      char payload[256];
+      snprintf(payload, sizeof(payload),
+        "{\"ID\":%d,\"heartRate\":%d,\"spo2\":%d,\"ambientTemp\":%.1f,\"bodyTemp\":%.1f,\"mpuStatus\":\"%s\",\"sosStatus\":\"%s\"}",
+        1,
+        localData.heartRate,
+        localData.spo2,
+        localData.ambientTemp,
+        localData.bodyTemp,
+        localData.mpuStatus.c_str(),
+        localData.sosStatus.c_str()
+      );
       
       // Set BLE characteristic value
-      sensorChar->setValue(payload.c_str());
+      sensorChar->setValue(payload);
       
-      // Only notify if client is connected
+      // Send if client is connected, otherwise skip
       if (deviceConnected) {
         sensorChar->notify();
-        Serial.println("BLE Sent: " + payload);
+        Serial.println(payload);
       } else {
-        Serial.println("No BLE client - Data: " + payload);
+        // Serial.println("No BLE client - Data lost: " + payload);
       }
       
-      // Reset impact flag after transmission attempt
-      if (impactDetectedForBLE) {
-        impactDetectedForBLE = false;
-        Serial.println("Impact BLE flag reset after transmission");
+      // Clear status messages after successful transmission
+      if (deviceConnected) {
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          if (isSOSTransmission) {
+            sharedData.sosStatus = "";
+          }
+          if (isImpactTransmission) {
+            sharedData.mpuStatus = "";
+          }
+          xSemaphoreGive(dataMutex);
+        }
+      }
+    }
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+void buttonTask(void *parameter) {
+  while(1) {
+    // Check SOS button (Button 1)
+    if (button1Pressed) {
+      button1Pressed = false;
+      // Serial.println("SOS!");
+      // Give feedback with short beep
+      buzzerShortBeep();
+      // Set SOS flag for immediate BLE transmission
+      sosMessageForBLE = true;
+      // Serial.println("SOS message queued for BLE transmission");
+      // Update shared data
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        sharedData.sosStatus = "SOS Alert";
+        xSemaphoreGive(dataMutex);
+      }
+      else {
+        sharedData.sosStatus= "";
       }
     }
     
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Check Cancel button (Button 2)
+    if (button2Pressed) {
+      button2Pressed = false;
+      // Serial.println("CANCEL BUTTON PRESSED!");
+      
+      // If fall alert is active and within cancel timeout
+      if (fallAlertActive && (millis() - fallDetectedTime < FALL_CANCEL_TIMEOUT)) {
+        Serial.println("CANCELLED");
+        fallAlertActive = false;
+        stopBuzzerAlert();
+        
+        // Clear impact status
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sharedData.mpuStatus = "";
+          sharedData.sosStatus = "";
+          xSemaphoreGive(dataMutex);
+        }
+        // Don't send BLE message for this fall
+        impactDetectedForBLE = false;
+      }
+    }
+    
+    vTaskDelay(50 / portTICK_PERIOD_MS);  // Check buttons every 50ms
+  }
+}
+
+void buzzerTask(void *parameter) {
+  bool buzzerState = false;
+  unsigned long lastToggle = 0;
+  const unsigned long BUZZ_INTERVAL = 500;  // 500ms on/off for continuous alert
+  
+  while(1) {
+    // Handle short beep (SOS feedback)
+    if (shortBeepActive) {
+      if (millis() - shortBeepStartTime >= SHORT_BEEP_DURATION) {
+        digitalWrite(buzzerPin, LOW);
+        shortBeepActive = false;
+        // Serial.println("SOS Buzzer beep finished");
+      }
+    }
+    // Handle continuous buzzing for fall alert (only if no short beep)
+    else if (buzzerActive) {
+      if (millis() - lastToggle >= BUZZ_INTERVAL) {
+        buzzerState = !buzzerState;
+        digitalWrite(buzzerPin, buzzerState ? HIGH : LOW);
+        lastToggle = millis();
+      }
+    } else {
+      // Ensure buzzer is off when not active
+      digitalWrite(buzzerPin, LOW);
+      buzzerState = false;
+    }
+    
+    vTaskDelay(10 / portTICK_PERIOD_MS);  // Faster check for responsive beeping
   }
 }
 
@@ -474,15 +691,15 @@ void initializeSensors() {
   Wire.begin(21, 22); // SDA, SCL for ESP32
   Wire.setClock(100000); // 100kHz for better MLX90614 compatibility
   
-  Serial.println("Initializing sensors...");
+  // Serial.println("Initializing sensors...");
   
   // Initialize MLX90614 first with multiple attempts
   bool mlxInitialized = false;
   for (int attempts = 0; attempts < 5; attempts++) {
-    Serial.println("MLX90614 init attempt " + String(attempts + 1));
+    // Serial.println("MLX90614 init attempt " + String(attempts + 1));
     if (mlx.begin()) {
       mlxInitialized = true;
-      Serial.println("MLX90614 initialized successfully!");
+      // Serial.println("MLX90614 initialized successfully!");
       break;
     }
     delay(500);
@@ -501,7 +718,7 @@ void initializeSensors() {
   particleSensor.setup();
   particleSensor.setPulseAmplitudeRed(0x0A);
   particleSensor.setPulseAmplitudeGreen(0);
-  Serial.println("MAX30105 initialized successfully!");
+  // Serial.println("MAX30105 initialized successfully!");
   
   // Initialize MPU9250
   mySensor.beginAccel();

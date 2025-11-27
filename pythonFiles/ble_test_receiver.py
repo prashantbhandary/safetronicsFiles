@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-SafeTonics BLE Data Receiver Test Script
-This script connects to the ESP32 BLE server and receives sensor data
-"""
-
 import asyncio
 import sys
 from bleak import BleakClient, BleakScanner
@@ -109,7 +103,6 @@ async def main():
         print(f"Error: {e}")
 
 if __name__ == "__main__":
-    # Check if bleak is installed
     try:
         import bleak
         asyncio.run(main())
